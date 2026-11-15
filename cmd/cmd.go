@@ -703,19 +703,57 @@ func loadOrUnloadModel(cmd *cobra.Command, opts *runOptions) error {
 		return nil
 	})
 }
+// TODO MGG - test "ollama stop all"
 
 func StopHandler(cmd *cobra.Command, args []string) error {
-	opts := &runOptions{
-		Model:     args[0],
-		KeepAlive: &api.Duration{Duration: 0},
-	}
-	if err := loadOrUnloadModel(cmd, opts); err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			return fmt.Errorf("couldn't find model \"%s\" to stop", args[0])
-		}
-		return err
-	}
-	return nil
+    // 1. Interceptar el argumento "all"
+    if args[0] == "all" {
+        client, err := api.ClientFromEnvironment()
+
+        if err != nil {
+            return err
+        }
+
+        // Obtener los modelos en ejecución (equivalente a 'ollama ps')
+        // Nota: Dependiendo de tu versión exacta, el método puede llamarse ListRunning o Ps
+        ctx := cmd.Context()
+        running, err := client.ListRunning(ctx) 
+
+        if err != nil {
+            return err
+        }
+
+        if len(running.Models) == 0 {
+            fmt.Println("No models are currently running.")
+            return nil
+        }
+
+        // Iterar y detener cada modelo
+        for _, m := range running.Models {
+            fmt.Printf("Stopping %s...\n", m.Name)
+            opts := &runOptions{
+                Model:     m.Name,
+                KeepAlive: &api.Duration{Duration: 0},
+            }
+            if err := loadOrUnloadModel(cmd, opts); err != nil {
+                fmt.Printf("Error stopping %s: %v\n", m.Name, err)
+            }
+        }
+        return nil
+    }
+
+    // 2. Lógica original para detener un solo modelo por su nombre
+    opts := &runOptions{
+        Model:     args[0],
+        KeepAlive: &api.Duration{Duration: 0},
+    }
+    if err := loadOrUnloadModel(cmd, opts); err != nil {
+        if strings.Contains(err.Error(), "not found") {
+            return fmt.Errorf("couldn't find model \"%s\" to stop", args[0])
+        }
+        return err
+    }
+    return nil
 }
 
 func generateEmbedding(cmd *cobra.Command, modelName, input string, keepAlive *api.Duration, truncate *bool, dimensions int) error {
@@ -2538,6 +2576,27 @@ func launcherActionExitsLoop(integration string) bool {
 	}
 }
 
+func modelAutocomplete(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+    if len(args) != 0 {
+        return nil, cobra.ShellCompDirectiveNoFileComp
+    }
+    client, err := api.ClientFromEnvironment()
+    if err != nil {
+        return nil, cobra.ShellCompDirectiveError
+    }
+    resp, err := client.List(cmd.Context())
+    if err != nil {
+        return nil, cobra.ShellCompDirectiveError
+    }
+    var models []string
+    for _, m := range resp.Models {
+        if strings.HasPrefix(m.Name, toComplete) {
+            models = append(models, m.Name)
+        }
+    }
+    return models, cobra.ShellCompDirectiveNoFileComp
+}
+
 func NewCLI() *cobra.Command {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	cobra.EnableCommandSorting = false
@@ -2552,7 +2611,7 @@ func NewCLI() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		CompletionOptions: cobra.CompletionOptions{
-			DisableDefaultCmd: true,
+			DisableDefaultCmd: false,
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if version, _ := cmd.Flags().GetBool("version"); version {
@@ -2599,6 +2658,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    ShowHandler,
+		ValidArgsFunction: modelAutocomplete,
 	}
 
 	showCmd.Flags().Bool("license", false, "Show license of a model")
@@ -2608,41 +2668,7 @@ func NewCLI() *cobra.Command {
 	showCmd.Flags().Bool("system", false, "Show system message of a model")
 	showCmd.Flags().BoolP("verbose", "v", false, "Show detailed model information")
 
-	runCmd := &cobra.Command{
-		Use:   "run MODEL [PROMPT]",
-		Short: "Run a model",
-		Example: `  ollama run gemma4
-  ollama run gemma4 "Why is the sky blue?"
-  ollama run nimble --ask "Is a refund being requested?" < ticket.txt
-  ollama run nimble --ask "Which team should handle this?" \
-    --choice billing="Payments and refunds" \
-    --choice technical="Software problems" < ticket.txt
-  ollama run nimble --ask "How urgent is this?" \
-    --level "Routine" \
-    --level "Soon" \
-    --level "Immediate" < ticket.txt`,
-		Args:    cobra.MinimumNArgs(1),
-		PreRunE: checkServerHeartbeat,
-		RunE:    RunHandler,
-	}
-
-	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
-	runCmd.Flags().Bool("verbose", false, "Show timings for response")
-	runCmd.Flags().Bool("insecure", false, "Use an insecure registry")
-	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
-	runCmd.Flags().String("format", "", "Response format (e.g. json)")
-	runCmd.Flags().String("runner", "", "Runner to use for manifest list selection (mlx, ggml, llamacpp)")
-	runCmd.Flags().MarkHidden("runner")
-	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
-	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
-	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
-	runCmd.Flags().Bool("truncate", false, "For embedding models: truncate inputs exceeding context length (default: true). Set --truncate=false to error instead")
-	runCmd.Flags().Int("dimensions", 0, "Truncate output embeddings to specified dimension (embedding models only)")
-	runCmd.Flags().String("voice", "", "Voice to speak with (speech models only)")
-	var asked []askedQuestion
-	runCmd.Flags().Var(questionFlag{"ask", &asked}, "ask", "Ask a decision model a question, answered yes or no unless --choice or --level follow")
-	runCmd.Flags().Var(questionFlag{"choice", &asked}, "choice", `Add a label for the preceding --ask to choose from, e.g. billing="Payments and refunds"`)
-	runCmd.Flags().Var(questionFlag{"level", &asked}, "level", "Add a level to score the preceding --ask on, from lowest to highest")
+	runCmd := NewRunCmd()
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
@@ -2650,6 +2676,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    StopHandler,
+		ValidArgsFunction: modelAutocomplete,
 	}
 
 	serveCmd := &cobra.Command{
@@ -2666,6 +2693,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    PullHandler,
+		ValidArgsFunction: modelAutocomplete,
 	}
 
 	pullCmd.Flags().Bool("insecure", false, "Use an insecure registry")
@@ -2678,6 +2706,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    PushHandler,
+		ValidArgsFunction: modelAutocomplete,
 	}
 
 	pushCmd.Flags().Bool("insecure", false, "Use an insecure registry")
@@ -2736,6 +2765,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(2),
 		PreRunE: checkServerHeartbeat,
 		RunE:    CopyHandler,
+		ValidArgsFunction: modelAutocomplete,
 	}
 
 	deleteCmd := &cobra.Command{
@@ -2744,6 +2774,7 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.MinimumNArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    DeleteHandler,
+		ValidArgsFunction: modelAutocomplete,
 	}
 
 	runnerCmd := &cobra.Command{
@@ -2821,7 +2852,8 @@ func NewCLI() *cobra.Command {
 		serveCmd,
 		createCmd,
 		showCmd,
-		runCmd,
+		//runCmd,
+		NewRunCmd(),
 		stopCmd,
 		pullCmd,
 		pushCmd,
@@ -2839,6 +2871,47 @@ func NewCLI() *cobra.Command {
 	)
 
 	return rootCmd
+}
+
+func NewRunCmd() *cobra.Command {
+	runCmd := &cobra.Command{
+		Use:   "run MODEL [PROMPT]",
+		Short: "Run a model",
+		Example: `  ollama run gemma4
+  ollama run gemma4 "Why is the sky blue?"
+  ollama run nimble --ask "Is a refund being requested?" < ticket.txt
+  ollama run nimble --ask "Which team should handle this?" \
+    --choice billing="Payments and refunds" \
+    --choice technical="Software problems" < ticket.txt
+  ollama run nimble --ask "How urgent is this?" \
+    --level "Routine" \
+    --level "Soon" \
+    --level "Immediate" < ticket.txt`,
+		Args:    cobra.MinimumNArgs(1),
+		PreRunE: checkServerHeartbeat,
+		RunE:    RunHandler,
+		ValidArgsFunction: modelAutocomplete,
+	}
+
+	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
+	runCmd.Flags().Bool("verbose", false, "Show timings for response")
+	runCmd.Flags().Bool("insecure", false, "Use an insecure registry")
+	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
+	runCmd.Flags().String("format", "", "Response format (e.g. json)")
+	runCmd.Flags().String("runner", "", "Runner to use for manifest list selection (mlx, ggml, llamacpp)")
+	runCmd.Flags().MarkHidden("runner")
+	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
+	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
+	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
+	runCmd.Flags().Bool("truncate", false, "For embedding models: truncate inputs exceeding context length (default: true). Set --truncate=false to error instead")
+	runCmd.Flags().Int("dimensions", 0, "Truncate output embeddings to specified dimension (embedding models only)")
+	runCmd.Flags().String("voice", "", "Voice to speak with (speech models only)")
+	var asked []askedQuestion
+	runCmd.Flags().Var(questionFlag{"ask", &asked}, "ask", "Ask a decision model a question, answered yes or no unless --choice or --level follow")
+	runCmd.Flags().Var(questionFlag{"choice", &asked}, "choice", `Add a label for the preceding --ask to choose from, e.g. billing="Payments and refunds"`)
+	runCmd.Flags().Var(questionFlag{"level", &asked}, "level", "Add a level to score the preceding --ask on, from lowest to highest")
+
+	return runCmd
 }
 
 // If the user has explicitly set thinking options, either through the CLI or
